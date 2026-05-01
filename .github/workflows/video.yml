@@ -5,32 +5,58 @@ jobs:
   render:
     runs-on: ubuntu-latest
     steps:
-      - name: Ставим софт намертво
+      - name: Установка пакетов
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
-          # Качаем бинарник yt-dlp напрямую, чтобы pip не ебал нам мозги
-          sudo wget https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -O /usr/local/bin/yt-dlp
-          sudo chmod a+rx /usr/local/bin/yt-dlp
+          sudo apt-get install -y ffmpeg curl jq
 
-      - name: Качаем трек и картинку
+      - name: Ломаем защиту SoundCloud (Прямой API)
         run: |
-          yt-dlp -o "track" --write-thumbnail -x --audio-format mp3 https://soundcloud.com/miralys-music/breathe
+          echo "Ищем ключи доступа..."
+          # Дергаем свежий client_id прямо из JS-скриптов сайта (потому что yt-dlp болеет)
+          CLIENT_ID=$(curl -sL "https://soundcloud.com/discover" | grep -oE '<script crossorigin src="https://a-v2\.sndcdn\.com/assets/[^"]+\.js"' | grep -oE 'https://[^"]+' | while read url; do curl -sL "$url" | grep -oE 'client_id:"[A-Za-z0-9]{32}"' ; done | head -n 1 | cut -d'"' -f2)
+          echo "Выцепили Client ID: $CLIENT_ID"
+          
+          TRACK_URL="https://soundcloud.com/miralys-music/breathe"
+          
+          # Запрашиваем всю подноготную трека через API виджета
+          curl -sL "https://api-widget.soundcloud.com/resolve?url=${TRACK_URL}&format=json&client_id=${CLIENT_ID}" > info.json
+          
+          # Пытаемся получить обычный MP3 стрим
+          STREAM_URL=$(jq -r '.media.transcodings[] | select(.format.protocol=="progressive") | .url' info.json | head -n 1)
+          
+          if [ -n "$STREAM_URL" ] && [ "$STREAM_URL" != "null" ]; then
+            echo "Нашли прямой MP3, качаем..."
+            MP3_URL=$(curl -sL "${STREAM_URL}?client_id=${CLIENT_ID}" | jq -r '.url')
+            curl -sL "$MP3_URL" -o track.mp3
+          else
+            echo "Прямого MP3 нет, перехватываем HLS поток..."
+            HLS_URL=$(jq -r '.media.transcodings[] | select(.format.protocol=="hls") | .url' info.json | head -n 1)
+            M3U8_URL=$(curl -sL "${HLS_URL}?client_id=${CLIENT_ID}" | jq -r '.url')
+            # Кормим HLS-ссылку напрямую в ffmpeg, чтобы он сам всё склеил
+            ffmpeg -i "$M3U8_URL" -q:a 2 track.mp3
+          fi
+          
+          # Пиздим обложку (если у трека нет обложки, скрипт умный — возьмет аватарку юзера)
+          COVER_URL=$(jq -r '.artwork_url // .user.avatar_url' info.json | sed 's/-large/-t500x500/')
+          if [ "$COVER_URL" != "null" ]; then
+            echo "Качаем картинку..."
+            curl -sL "$COVER_URL" -o track.jpg
+          fi
 
-      - name: Рендерим видос
+      - name: Рендерим видео (Магия FFmpeg)
         run: |
-          # Ищем обложку. Если саундклауд ее не отдал, скрипт сделает черную заглушку, чтобы ничего не наебнулось
           COVER=$(ls track.* | grep -E '\.(jpg|png|webp|jpeg)$' | head -n 1)
           if [ -z "$COVER" ]; then
-            echo "Обложки нет, ебашим черный квадрат."
+            echo "Нихуя нет картинок, ставим черный фон."
             ffmpeg -f lavfi -i color=c=black:s=800x800:d=1 -frames:v 1 fake_cover.jpg
             COVER="fake_cover.jpg"
           fi
           
-          # Рендерим! (добавил умное масштабирование, чтобы обложка не сплющивалась, если она не квадратная)
+          echo "Хуярим видос 16:9 с прыгающей волной..."
           ffmpeg -loop 1 -i "$COVER" -i track.mp3 -filter_complex "[0:v]scale=800:800:force_original_aspect_ratio=decrease,pad=800:800:(ow-iw)/2:(oh-ih)/2[img];[img]pad=1920:1080:(1920-800)/2:(1080-800)/2:black[bg];[1:a]showwaves=s=1920x300:colors=0xff5500:mode=cline[wave];[wave]colorkey=0x000000:0.1:0.5[twave];[bg][twave]overlay=0:H-h" -c:v libx264 -preset fast -tune stillimage -c:a aac -b:a 192k -pix_fmt yuv420p -shortest output.mp4
           
-      - name: Выгружаем готовый видос
+      - name: Отдаем готовый шедевр
         uses: actions/upload-artifact@v4
         with:
           name: YouTube-Video
